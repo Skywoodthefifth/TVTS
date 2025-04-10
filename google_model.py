@@ -28,7 +28,7 @@ class GoogleModel():
     def generate_content(self, message: str) -> str:
         print(f"Starting chat completion with model: {self.model_name}")
         chat = self.client.chats.create(model=self.model_name, history=self.conversation_history)  # Include conversation history
-        message = f"Bạn là một phụ trách viên về hướng dẫn tư vấn tuyển sinh cho đại học Bách Khoa Đà Nẵng. Hãy trả lời các câu hỏi đầy đủ thông tin và ngắn gọn, như đang nói chuyện với người bạn của mình.\n\nCâu hỏi: {message}\n\nTrả lời trong vòng 100 từ."
+        message = f"Bạn là một phụ trách viên hướng dẫn tư vấn tuyển sinh cho trường đại học Bách Khoa Đà Nẵng. Hãy trả lời các câu hỏi một cách đầy đủ các thông tin đã được cho và câu trả lời phải ngắn gọn, chuyên nghiệp, đầy khả năng thu hút các học sinh đang có nguyện vọng vào trường đại học Bách Khoa Đà Nẵng hoặc đang phân vân về nguyện vọng của mình.\n\nCâu hỏi: {message}\n\nTrả lời trong vòng 100 từ."
         # print("Question: ", message)
 
         try:
