@@ -1,7 +1,10 @@
 import os
 import re
 from time import sleep
-from typing import List, Dict
+from typing import List, Dict, Tuple
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
 
 from google import genai
 from google.genai import types
@@ -23,6 +26,21 @@ class GoogleModel():
         
         # Parse the bachkhoa_combined.txt file for RAG
         self.knowledge_base = self._parse_knowledge_base("bachkhoa_combined.txt")
+        
+        # Initialize Vietnamese embedding model
+        print("Loading Vietnamese embedding model...")
+        try:
+            self.embedding_model = SentenceTransformer('keepitreal/vietnamese-sbert')
+            self.embeddings_available = True
+            
+            # Pre-compute embeddings for knowledge base
+            print("Computing embeddings for knowledge base...")
+            self._compute_knowledge_embeddings()
+        except Exception as e:
+            print(f"Warning: Could not load embedding model: {e}")
+            print("Falling back to keyword-only search")
+            self.embedding_model = None
+            self.embeddings_available = False
         
         self.conversation_history: list[Content] = []  # Initialize conversation history
 
@@ -60,7 +78,23 @@ class GoogleModel():
         print(f"Loaded {len(knowledge_base)} question-answer pairs from knowledge base")
         return knowledge_base
     
-    def _search_relevant_content(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    def _compute_knowledge_embeddings(self):
+        """Pre-compute embeddings for all questions and answers in knowledge base."""
+        if not self.knowledge_base:
+            self.question_embeddings = np.array([])
+            self.answer_embeddings = np.array([])
+            return
+        
+        questions = [item['question'] for item in self.knowledge_base]
+        answers = [item['answer'] for item in self.knowledge_base]
+        
+        # Compute embeddings
+        self.question_embeddings = self.embedding_model.encode(questions, show_progress_bar=True)
+        self.answer_embeddings = self.embedding_model.encode(answers, show_progress_bar=True)
+        
+        print(f"Computed embeddings for {len(questions)} question-answer pairs")
+    
+    def _keyword_search(self, query: str, max_results: int = 5) -> List[Tuple[float, Dict[str, str]]]:
         """Search for relevant content in the knowledge base using keyword matching."""
         query_lower = query.lower()
         query_words = re.findall(r'\w+', query_lower)
@@ -84,9 +118,129 @@ class GoogleModel():
             if score > 0:
                 scored_results.append((score, item))
         
-        # Sort by score and return top results
+        # Sort by score and return top results with scores
         scored_results.sort(key=lambda x: x[0], reverse=True)
-        return [item for score, item in scored_results[:max_results]]
+        return scored_results[:max_results]
+    
+    def _semantic_search(self, query: str, max_results: int = 5) -> List[Tuple[float, Dict[str, str]]]:
+        """Search for relevant content using Vietnamese semantic embeddings."""
+        if len(self.question_embeddings) == 0:
+            return []
+        
+        # Encode the query
+        query_embedding = self.embedding_model.encode([query])
+        
+        # Calculate cosine similarity with questions
+        question_similarities = cosine_similarity(query_embedding, self.question_embeddings)[0]
+        
+        # Calculate cosine similarity with answers (lower weight)
+        answer_similarities = cosine_similarity(query_embedding, self.answer_embeddings)[0]
+        
+        # Combine similarities (questions weighted higher)
+        combined_similarities = question_similarities * 0.7 + answer_similarities * 0.3
+        
+        # Get top results
+        top_indices = np.argsort(combined_similarities)[::-1][:max_results]
+        
+        results = []
+        for idx in top_indices:
+            if combined_similarities[idx] > 0.1:  # Minimum similarity threshold
+                results.append((float(combined_similarities[idx]), self.knowledge_base[idx]))
+        
+        return results
+    
+    def _hybrid_search(self, query: str, max_results: int = 5) -> List[Tuple[float, Dict[str, str]]]:
+        """Combine keyword and semantic search results."""
+        # Get keyword results
+        keyword_results = self._keyword_search(query, max_results * 2)
+        
+        # Get semantic results if embeddings are available
+        if self.embeddings_available:
+            semantic_results = self._semantic_search(query, max_results * 2)
+        else:
+            print("Using keyword-only search (embeddings not available)")
+            # Return keyword results only if no embeddings
+            return keyword_results
+        
+        # Normalize scores and combine
+        combined_scores = {}
+        
+        # Process keyword results (normalize to 0-1)
+        if keyword_results:
+            max_keyword_score = max(score for score, _ in keyword_results) if keyword_results else 1
+            for score, item in keyword_results:
+                key = (item['question'], item['answer'])
+                normalized_score = score / max_keyword_score if max_keyword_score > 0 else 0
+                combined_scores[key] = combined_scores.get(key, 0) + normalized_score * 0.4
+        
+        # Process semantic results (already 0-1)
+        for score, item in semantic_results:
+            key = (item['question'], item['answer'])
+            combined_scores[key] = combined_scores.get(key, 0) + score * 0.6
+        
+        # Convert back to list and sort
+        final_results = []
+        for (question, answer), score in combined_scores.items():
+            final_results.append((score, {'question': question, 'answer': answer}))
+        
+        final_results.sort(key=lambda x: x[0], reverse=True)
+        return final_results[:max_results]
+    
+    def _contextual_rerank(self, results: List[Tuple[float, Dict[str, str]]], 
+                          query: str, conversation_history: List[Content]) -> List[Dict[str, str]]:
+        """Re-rank results based on conversational context and relevance."""
+        if not results:
+            return []
+        
+        # Extract recent conversation context
+        recent_context = ""
+        if conversation_history:
+            # Get last few exchanges for context
+            recent_messages = conversation_history[-4:]  # Last 2 exchanges
+            for content in recent_messages:
+                if hasattr(content, 'parts') and content.parts:
+                    recent_context += content.parts[0].text + " "
+        
+        reranked_results = []
+        
+        for score, item in results:
+            # Calculate contextual relevance
+            contextual_score = score
+            
+            # Boost score if answer mentions topics from recent conversation
+            if recent_context:
+                context_words = set(re.findall(r'\w+', recent_context.lower()))
+                answer_words = set(re.findall(r'\w+', item['answer'].lower()))
+                
+                # Calculate overlap with recent context
+                overlap = len(context_words.intersection(answer_words))
+                if overlap > 0:
+                    contextual_score *= (1 + overlap * 0.1)  # Boost by up to 50%
+            
+            # Boost score for shorter, more direct answers (better for chat)
+            answer_length = len(item['answer'].split())
+            if answer_length < 50:  # Prefer concise answers
+                contextual_score *= 1.1
+            elif answer_length > 200:  # Penalize very long answers
+                contextual_score *= 0.9
+            
+            reranked_results.append((contextual_score, item))
+        
+        # Sort by new contextual score
+        reranked_results.sort(key=lambda x: x[0], reverse=True)
+        
+        # Return just the items without scores
+        return [item for score, item in reranked_results]
+    
+    def _search_relevant_content(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
+        """Main search method that uses hybrid search with contextual re-ranking."""
+        # Use hybrid search
+        hybrid_results = self._hybrid_search(query, max_results * 2)
+        
+        # Apply contextual re-ranking
+        final_results = self._contextual_rerank(hybrid_results, query, self.conversation_history)
+        
+        return final_results[:max_results]
 
     def generate_content(self, message: str) -> str:
         print(f"Starting chat completion with model: {self.model_name}")
