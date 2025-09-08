@@ -1,4 +1,5 @@
 import os
+import os.path
 import re
 from time import sleep
 from typing import List, Dict, Tuple
@@ -78,6 +79,35 @@ class GoogleModel():
         print(f"Loaded {len(knowledge_base)} question-answer pairs from knowledge base")
         return knowledge_base
     
+    def _load_embeddings_from_file(self, embeddings_file: str) -> bool:
+        """Load pre-computed embeddings from file if available."""
+        if not os.path.exists(embeddings_file):
+            print(f"Embeddings file {embeddings_file} not found. Will compute new embeddings.")
+            return False
+        
+        try:
+            print(f"Loading embeddings from {embeddings_file}...")
+            data = np.load(embeddings_file)
+            self.question_embeddings = data['question_embeddings']
+            self.answer_embeddings = data['answer_embeddings']
+            print(f"Successfully loaded embeddings for {len(self.question_embeddings)} question-answer pairs")
+            return True
+        except Exception as e:
+            print(f"Error loading embeddings from file: {e}")
+            print("Will compute new embeddings.")
+            return False
+    
+    def _save_embeddings_to_file(self, embeddings_file: str):
+        """Save computed embeddings to file for future use."""
+        try:
+            print(f"Saving embeddings to {embeddings_file}...")
+            np.savez_compressed(embeddings_file, 
+                              question_embeddings=self.question_embeddings,
+                              answer_embeddings=self.answer_embeddings)
+            print(f"Successfully saved embeddings to {embeddings_file}")
+        except Exception as e:
+            print(f"Error saving embeddings to file: {e}")
+    
     def _compute_knowledge_embeddings(self):
         """Pre-compute embeddings for all questions and answers in knowledge base."""
         if not self.knowledge_base:
@@ -85,14 +115,26 @@ class GoogleModel():
             self.answer_embeddings = np.array([])
             return
         
+        # Define embeddings file path
+        embeddings_file = "knowledge_embeddings.npz"
+        
+        # Try to load existing embeddings first
+        if self._load_embeddings_from_file(embeddings_file):
+            return
+        
+        # If loading failed, compute new embeddings
         questions = [item['question'] for item in self.knowledge_base]
         answers = [item['answer'] for item in self.knowledge_base]
         
         # Compute embeddings
+        print("Computing new embeddings...")
         self.question_embeddings = self.embedding_model.encode(questions, show_progress_bar=True)
         self.answer_embeddings = self.embedding_model.encode(answers, show_progress_bar=True)
         
         print(f"Computed embeddings for {len(questions)} question-answer pairs")
+        
+        # Save embeddings to file for future use
+        self._save_embeddings_to_file(embeddings_file)
     
     def _keyword_search(self, query: str, max_results: int = 5) -> List[Tuple[float, Dict[str, str]]]:
         """Search for relevant content in the knowledge base using keyword matching."""
